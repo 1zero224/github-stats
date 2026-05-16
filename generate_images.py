@@ -120,6 +120,10 @@ async def main() -> None:
         not not raw_ignore_forked_repos
         and raw_ignore_forked_repos.strip().lower() != "false"
     )
+    raw_additional = os.getenv("ADDITIONAL_USERNAMES")
+    additional_usernames = (
+        {x.strip() for x in raw_additional.split(",")} if raw_additional else None
+    )
     async with aiohttp.ClientSession() as session:
         s = Stats(
             user,
@@ -128,6 +132,7 @@ async def main() -> None:
             exclude_repos=excluded_repos,
             exclude_langs=excluded_langs,
             ignore_forked_repos=ignore_forked_repos,
+            additional_usernames=additional_usernames,
         )
         await asyncio.gather(generate_languages(s), generate_overview(s))
 

@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import asyncio
+import json
 import os
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
@@ -65,15 +66,16 @@ class Queries(object):
                     return result
         return dict()
 
-    async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
+    async def query_rest(self, path: str, params: Optional[Dict] = None, max_retries: int = 10) -> Any:
         """
         Make a request to the REST API
         :param path: API path to query
         :param params: Query parameters to be passed to the API
+        :param max_retries: Maximum number of retries on 202 (default: 10)
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
+        for attempt in range(max_retries):
             headers = {
                 "Authorization": f"token {self.access_token}",
             }
@@ -89,31 +91,37 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                 if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
-                    continue
+                    if attempt < max_retries - 1:
+                        delay = min(2 ** attempt, 10)  # exponential backoff, max 10s
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        break
 
                 result = await r_async.json()
                 if result is not None:
                     return result
             except:
-                print("aiohttp failed for rest query")
                 # Fall back on non-async requests
-                async with self.semaphore:
-                    r_requests = requests.get(
-                        f"https://api.github.com/{path}",
-                        headers=headers,
-                        params=tuple(params.items()),
-                    )
-                    if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
-                        continue
-                    elif r_requests.status_code == 200:
-                        return r_requests.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
+                try:
+                    async with self.semaphore:
+                        r_requests = requests.get(
+                            f"https://api.github.com/{path}",
+                            headers=headers,
+                            params=tuple(params.items()),
+                        )
+                        if r_requests.status_code == 202:
+                            if attempt < max_retries - 1:
+                                delay = min(2 ** attempt, 10)
+                                await asyncio.sleep(delay)
+                                continue
+                            else:
+                                break
+                        elif r_requests.status_code == 200:
+                            return r_requests.json()
+                except:
+                    pass
+
         return dict()
 
     @staticmethod
@@ -258,8 +266,10 @@ class Stats(object):
         exclude_repos: Optional[Set] = None,
         exclude_langs: Optional[Set] = None,
         ignore_forked_repos: bool = False,
+        additional_usernames: Optional[Set[str]] = None,
     ):
         self.username = username
+        self._additional_usernames = additional_usernames or set()
         self._ignore_forked_repos = ignore_forked_repos
         self._exclude_repos = set() if exclude_repos is None else exclude_repos
         self._exclude_langs = set() if exclude_langs is None else exclude_langs
@@ -491,28 +501,64 @@ Languages:
     async def lines_changed(self) -> Tuple[int, int]:
         """
         :return: count of total lines added, removed, or modified by the user
+        Uses file caching to avoid repeated API calls across CI runs.
         """
         if self._lines_changed is not None:
             return self._lines_changed
-        additions = 0
-        deletions = 0
-        for repo in await self.repos:
-            r = await self.queries.query_rest(f"/repos/{repo}/stats/contributors")
-            for author_obj in r:
-                # Handle malformed response from the API by skipping this repo
+
+        # Try loading from cache file
+        cache_path = "generated/lines_changed_cache.json"
+        try:
+            if os.path.exists(cache_path):
+                with open(cache_path, "r") as f:
+                    cached = json.load(f)
+                    self._lines_changed = (cached["additions"], cached["deletions"])
+                    return self._lines_changed
+        except Exception:
+            pass
+
+        repos = await self.repos
+
+        # Build set of names to match: viewer.login + GITHUB_ACTOR + additional
+        match_names = {await self.login, self.username} | self._additional_usernames
+
+        async def query_repo(repo: str) -> Tuple[int, int]:
+            """Query a single repo's contributor stats in parallel."""
+            r = await self.queries.query_rest(
+                f"/repos/{repo}/stats/contributors",
+                max_retries=5
+            )
+            repo_additions = 0
+            repo_deletions = 0
+            for author_obj in r if isinstance(r, list) else []:
                 if not isinstance(author_obj, dict) or not isinstance(
                     author_obj.get("author", {}), dict
                 ):
                     continue
                 author = author_obj.get("author", {}).get("login", "")
-                if author != await self.login:
+                if author not in match_names:
                     continue
-
                 for week in author_obj.get("weeks", []):
-                    additions += week.get("a", 0)
-                    deletions += week.get("d", 0)
+                    repo_additions += week.get("a", 0)
+                    repo_deletions += week.get("d", 0)
+            return repo_additions, repo_deletions
+
+        # Query all repos in parallel
+        results = await asyncio.gather(*[query_repo(r) for r in repos])
+
+        additions = sum(r[0] for r in results)
+        deletions = sum(r[1] for r in results)
 
         self._lines_changed = (additions, deletions)
+
+        # Save to cache file
+        try:
+            os.makedirs("generated", exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump({"additions": additions, "deletions": deletions}, f)
+        except Exception:
+            pass
+
         return self._lines_changed
 
     @property
