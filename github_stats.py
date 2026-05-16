@@ -1,12 +1,70 @@
 #!/usr/bin/python3
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
 import requests
+
+
+LINES_CHANGED_CACHE_PATH = Path("generated/lines_changed_cache.json")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _build_lines_changed_cache(
+    additions: int, deletions: int, now: Optional[datetime] = None
+) -> Dict[str, Any]:
+    cached_at = _utc_now() if now is None else now.astimezone(timezone.utc)
+    return {
+        "additions": additions,
+        "deletions": deletions,
+        "cached_at": cached_at.isoformat(),
+    }
+
+
+def _parse_lines_changed_cache(
+    cached: Any, now: Optional[datetime] = None
+) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int]], str]:
+    current_time = _utc_now() if now is None else now.astimezone(timezone.utc)
+    if not isinstance(cached, dict):
+        return None, None, "invalid_format"
+
+    try:
+        additions = int(cached["additions"])
+        deletions = int(cached["deletions"])
+    except (KeyError, TypeError, ValueError):
+        return None, None, "invalid_counts"
+
+    parsed = (additions, deletions)
+    fallback = parsed if additions + deletions > 0 else None
+    cached_at = cached.get("cached_at")
+
+    if fallback is None:
+        return None, None, "zero_total"
+    if not isinstance(cached_at, str):
+        return None, fallback, "missing_cached_at"
+
+    try:
+        cached_time = datetime.fromisoformat(cached_at)
+    except ValueError:
+        return None, fallback, "invalid_cached_at"
+
+    if cached_time.tzinfo is None:
+        cached_time = cached_time.replace(tzinfo=timezone.utc)
+    else:
+        cached_time = cached_time.astimezone(timezone.utc)
+
+    if cached_time.date() != current_time.date():
+        return None, fallback, "stale_day"
+
+    return parsed, fallback, "fresh"
 
 
 ###############################################################################
@@ -506,31 +564,50 @@ Languages:
         if self._lines_changed is not None:
             return self._lines_changed
 
-        # Try loading from cache file
-        cache_path = "generated/lines_changed_cache.json"
+        cache_path = LINES_CHANGED_CACHE_PATH
+        fallback_cache = None
         try:
-            if os.path.exists(cache_path):
-                with open(cache_path, "r") as f:
+            if cache_path.exists():
+                with cache_path.open("r") as f:
                     cached = json.load(f)
-                    self._lines_changed = (cached["additions"], cached["deletions"])
+                cached_value, fallback_cache, cache_status = _parse_lines_changed_cache(
+                    cached
+                )
+                if cached_value is not None:
+                    self._lines_changed = cached_value
                     return self._lines_changed
-        except Exception:
-            pass
+                print(f"Lines changed cache ignored: {cache_status}.")
+        except Exception as exc:
+            print(f"Failed to read lines changed cache: {exc}")
 
         repos = await self.repos
 
         # Build set of names to match: viewer.login + GITHUB_ACTOR + additional
-        match_names = {await self.login, self.username} | self._additional_usernames
+        match_names = {
+            name
+            for name in ({await self.login, self.username} | self._additional_usernames)
+            if name
+        }
 
-        async def query_repo(repo: str) -> Tuple[int, int]:
+        async def query_repo(repo: str) -> Dict[str, Any]:
             """Query a single repo's contributor stats in parallel."""
             r = await self.queries.query_rest(
                 f"/repos/{repo}/stats/contributors",
-                max_retries=5
+                max_retries=8,
             )
+            result = {
+                "repo": repo,
+                "stats_ready": isinstance(r, list),
+                "matched": False,
+                "additions": 0,
+                "deletions": 0,
+            }
+            if not isinstance(r, list):
+                return result
+
             repo_additions = 0
             repo_deletions = 0
-            for author_obj in r if isinstance(r, list) else []:
+            for author_obj in r:
                 if not isinstance(author_obj, dict) or not isinstance(
                     author_obj.get("author", {}), dict
                 ):
@@ -538,26 +615,73 @@ Languages:
                 author = author_obj.get("author", {}).get("login", "")
                 if author not in match_names:
                     continue
+                result["matched"] = True
                 for week in author_obj.get("weeks", []):
                     repo_additions += week.get("a", 0)
                     repo_deletions += week.get("d", 0)
-            return repo_additions, repo_deletions
+            result["additions"] = repo_additions
+            result["deletions"] = repo_deletions
+            return result
 
         # Query all repos in parallel
         results = await asyncio.gather(*[query_repo(r) for r in repos])
 
-        additions = sum(r[0] for r in results)
-        deletions = sum(r[1] for r in results)
+        additions = sum(cast(int, r["additions"]) for r in results)
+        deletions = sum(cast(int, r["deletions"]) for r in results)
+        stats_ready_count = sum(1 for r in results if r["stats_ready"])
+        matched_repo_count = sum(1 for r in results if r["matched"])
+        nonzero_repo_count = sum(
+            1 for r in results if r["additions"] or r["deletions"]
+        )
 
-        self._lines_changed = (additions, deletions)
+        print(
+            "Lines changed diagnostics: "
+            f"repos={len(repos)}, "
+            f"stats_ready={stats_ready_count}, "
+            f"matched_repos={matched_repo_count}, "
+            f"nonzero_repos={nonzero_repo_count}, "
+            f"match_names={sorted(match_names)}"
+        )
 
-        # Save to cache file
-        try:
-            os.makedirs("generated", exist_ok=True)
-            with open(cache_path, "w") as f:
-                json.dump({"additions": additions, "deletions": deletions}, f)
-        except Exception:
-            pass
+        if additions + deletions > 0:
+            self._lines_changed = (additions, deletions)
+
+            try:
+                os.makedirs(cache_path.parent, exist_ok=True)
+                with cache_path.open("w") as f:
+                    json.dump(_build_lines_changed_cache(additions, deletions), f)
+            except Exception as exc:
+                print(f"Failed to write lines changed cache: {exc}")
+            return self._lines_changed
+
+        pending_repos = [r["repo"] for r in results if not r["stats_ready"]][:5]
+        unmatched_repos = [
+            r["repo"] for r in results if r["stats_ready"] and not r["matched"]
+        ][:5]
+        if pending_repos:
+            print(
+                "Contributor stats unavailable for sample repos: "
+                + ", ".join(cast(List[str], pending_repos))
+            )
+        if unmatched_repos:
+            print(
+                "No matching contributor login found for sample repos: "
+                + ", ".join(cast(List[str], unmatched_repos))
+            )
+
+        if fallback_cache is not None:
+            print(
+                "GitHub contributor stats returned zero lines changed; "
+                "reusing the previous non-zero cache."
+            )
+            self._lines_changed = fallback_cache
+            return self._lines_changed
+
+        print(
+            "GitHub contributor stats returned zero lines changed and "
+            "no non-zero cache is available."
+        )
+        self._lines_changed = (0, 0)
 
         return self._lines_changed
 
