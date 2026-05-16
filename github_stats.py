@@ -18,6 +18,10 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _graphql_string(value: Optional[str]) -> str:
+    return "null" if value is None else json.dumps(value)
+
+
 def _build_lines_changed_cache(
     additions: int, deletions: int, now: Optional[datetime] = None
 ) -> Dict[str, Any]:
@@ -110,18 +114,21 @@ class Queries(object):
             result = await r_async.json()
             if result is not None:
                 return result
-        except:
-            print("aiohttp failed for GraphQL query")
+        except Exception as exc:
+            print(f"aiohttp failed for GraphQL query: {exc}")
             # Fall back on non-async requests
-            async with self.semaphore:
-                r_requests = requests.post(
-                    "https://api.github.com/graphql",
-                    headers=headers,
-                    json={"query": generated_query},
-                )
-                result = r_requests.json()
-                if result is not None:
-                    return result
+            try:
+                async with self.semaphore:
+                    r_requests = requests.post(
+                        "https://api.github.com/graphql",
+                        headers=headers,
+                        json={"query": generated_query},
+                    )
+                    result = r_requests.json()
+                    if result is not None:
+                        return result
+            except Exception as fallback_exc:
+                print(f"requests failed for GraphQL query: {fallback_exc}")
         return dict()
 
     async def query_rest(self, path: str, params: Optional[Dict] = None, max_retries: int = 10) -> Any:
@@ -191,6 +198,7 @@ class Queries(object):
         """
         return f"""{{
   viewer {{
+    id
     login,
     name,
     repositories(
@@ -200,7 +208,7 @@ class Queries(object):
             direction: DESC
         }},
         isFork: false,
-        after: {"null" if owned_cursor is None else '"'+ owned_cursor +'"'}
+        after: {_graphql_string(owned_cursor)}
     ) {{
       pageInfo {{
         hasNextPage
@@ -236,7 +244,7 @@ class Queries(object):
             REPOSITORY,
             PULL_REQUEST_REVIEW
         ]
-        after: {"null" if contrib_cursor is None else '"'+ contrib_cursor +'"'}
+        after: {_graphql_string(contrib_cursor)}
     ) {{
       pageInfo {{
         hasNextPage
@@ -254,6 +262,58 @@ class Queries(object):
             node {{
               name
               color
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+}}
+"""
+
+    @staticmethod
+    def user_id(login: str) -> str:
+        """
+        :param login: GitHub login to resolve
+        :return: GraphQL query for the user's node ID
+        """
+        return f"""
+query {{
+  user(login: {_graphql_string(login)}) {{
+    id
+  }}
+}}
+"""
+
+    @staticmethod
+    def repo_commit_history(
+        owner: str, name: str, author_id: str, cursor: Optional[str] = None
+    ) -> str:
+        """
+        :param owner: repository owner
+        :param name: repository name
+        :param author_id: GitHub node ID for the author
+        :param cursor: pagination cursor
+        :return: GraphQL query for commit history authored by the target user
+        """
+        return f"""
+query {{
+  repository(owner: {_graphql_string(owner)}, name: {_graphql_string(name)}) {{
+    defaultBranchRef {{
+      target {{
+        ... on Commit {{
+          history(
+            first: 100,
+            author: {{id: {_graphql_string(author_id)}}},
+            after: {_graphql_string(cursor)}
+          ) {{
+            pageInfo {{
+              hasNextPage
+              endCursor
+            }}
+            nodes {{
+              additions
+              deletions
             }}
           }}
         }}
@@ -342,6 +402,7 @@ class Stats(object):
         self._lines_changed: Optional[Tuple[int, int]] = None
         self._views: Optional[int] = None
         self._login: Optional[str] = None
+        self._viewer_id: Optional[str] = None
 
     async def to_str(self) -> str:
         """
@@ -385,12 +446,10 @@ Languages:
             )
             raw_results = raw_results if raw_results is not None else {}
 
-            self._login = (
-                raw_results.get("data", {})
-                .get("viewer", {})
-                .get("login", self.username)
-            )
-            self._name = raw_results.get("data", {}).get("viewer", {}).get("name", None)
+            viewer = raw_results.get("data", {}).get("viewer", {})
+            self._viewer_id = viewer.get("id", self._viewer_id)
+            self._login = viewer.get("login", self.username)
+            self._name = viewer.get("name", None)
             if self._name is None:
                 self._name = self._login
 
@@ -517,6 +576,15 @@ Languages:
         return self._login
 
     @property
+    async def viewer_id(self) -> Optional[str]:
+        """
+        :return: GitHub node ID of the authenticated user
+        """
+        if self._viewer_id is None:
+            await self.get_stats()
+        return self._viewer_id
+
+    @property
     async def repos(self) -> Set[str]:
         """
         :return: list of names of user's repos
@@ -581,55 +649,94 @@ Languages:
             print(f"Failed to read lines changed cache: {exc}")
 
         repos = await self.repos
-
-        # Build set of names to match: viewer.login + GITHUB_ACTOR + additional
         match_names = {
             name
             for name in ({await self.login, self.username} | self._additional_usernames)
             if name
         }
+        resolved_author_ids: Dict[str, str] = {}
+        viewer_id = await self.viewer_id
+        viewer_login = await self.login
+        if viewer_id:
+            for name in {viewer_login, self.username}:
+                if name:
+                    resolved_author_ids[name] = viewer_id
+
+        unresolved_names = sorted(
+            name for name in match_names if name not in resolved_author_ids
+        )
+        for name in unresolved_names:
+            raw_result = await self.queries.query(Queries.user_id(name))
+            author_id = raw_result.get("data", {}).get("user", {}).get("id")
+            if author_id:
+                resolved_author_ids[name] = author_id
+
+        author_ids = sorted({author_id for author_id in resolved_author_ids.values()})
+        unresolved_names = sorted(name for name in match_names if name not in resolved_author_ids)
 
         async def query_repo(repo: str) -> Dict[str, Any]:
-            """Query a single repo's contributor stats in parallel."""
-            r = await self.queries.query_rest(
-                f"/repos/{repo}/stats/contributors",
-                max_retries=8,
-            )
+            """Query a single repo's commit history in parallel."""
+            owner, name = repo.split("/", 1)
             result = {
                 "repo": repo,
-                "stats_ready": isinstance(r, list),
+                "history_retrieved": False,
                 "matched": False,
+                "pages": 0,
+                "commits": 0,
                 "additions": 0,
                 "deletions": 0,
             }
-            if not isinstance(r, list):
-                return result
 
-            repo_additions = 0
-            repo_deletions = 0
-            for author_obj in r:
-                if not isinstance(author_obj, dict) or not isinstance(
-                    author_obj.get("author", {}), dict
-                ):
-                    continue
-                author = author_obj.get("author", {}).get("login", "")
-                if author not in match_names:
-                    continue
-                result["matched"] = True
-                for week in author_obj.get("weeks", []):
-                    repo_additions += week.get("a", 0)
-                    repo_deletions += week.get("d", 0)
-            result["additions"] = repo_additions
-            result["deletions"] = repo_deletions
+            for author_id in author_ids:
+                cursor = None
+                while True:
+                    raw_result = await self.queries.query(
+                        Queries.repo_commit_history(owner, name, author_id, cursor)
+                    )
+                    default_branch = (
+                        raw_result.get("data", {})
+                        .get("repository", {})
+                        .get("defaultBranchRef", {})
+                        or {}
+                    )
+                    target = default_branch.get("target", {}) or {}
+                    history = target.get("history")
+                    if not isinstance(history, dict):
+                        break
+
+                    result["history_retrieved"] = True
+                    result["pages"] += 1
+
+                    nodes = history.get("nodes", [])
+                    if nodes:
+                        result["matched"] = True
+
+                    for node in nodes:
+                        if not isinstance(node, dict):
+                            continue
+                        result["commits"] += 1
+                        result["additions"] += int(node.get("additions", 0) or 0)
+                        result["deletions"] += int(node.get("deletions", 0) or 0)
+
+                    page_info = history.get("pageInfo", {})
+                    if not page_info.get("hasNextPage", False):
+                        break
+
+                    next_cursor = page_info.get("endCursor")
+                    if not next_cursor or next_cursor == cursor:
+                        break
+                    cursor = next_cursor
+
             return result
 
-        # Query all repos in parallel
         results = await asyncio.gather(*[query_repo(r) for r in repos])
 
         additions = sum(cast(int, r["additions"]) for r in results)
         deletions = sum(cast(int, r["deletions"]) for r in results)
-        stats_ready_count = sum(1 for r in results if r["stats_ready"])
+        history_repo_count = sum(1 for r in results if r["history_retrieved"])
         matched_repo_count = sum(1 for r in results if r["matched"])
+        page_count = sum(cast(int, r["pages"]) for r in results)
+        commit_count = sum(cast(int, r["commits"]) for r in results)
         nonzero_repo_count = sum(
             1 for r in results if r["additions"] or r["deletions"]
         )
@@ -637,10 +744,15 @@ Languages:
         print(
             "Lines changed diagnostics: "
             f"repos={len(repos)}, "
-            f"stats_ready={stats_ready_count}, "
+            f"author_ids={len(author_ids)}, "
+            f"history_repos={history_repo_count}, "
             f"matched_repos={matched_repo_count}, "
+            f"pages={page_count}, "
+            f"commits={commit_count}, "
             f"nonzero_repos={nonzero_repo_count}, "
-            f"match_names={sorted(match_names)}"
+            f"match_names={sorted(match_names)}, "
+            f"resolved_names={sorted(resolved_author_ids)}, "
+            f"unresolved_names={unresolved_names}"
         )
 
         if additions + deletions > 0:
@@ -654,31 +766,31 @@ Languages:
                 print(f"Failed to write lines changed cache: {exc}")
             return self._lines_changed
 
-        pending_repos = [r["repo"] for r in results if not r["stats_ready"]][:5]
-        unmatched_repos = [
-            r["repo"] for r in results if r["stats_ready"] and not r["matched"]
+        history_missing_repos = [
+            r["repo"] for r in results if not r["history_retrieved"]
         ][:5]
-        if pending_repos:
+        unmatched_repos = [r["repo"] for r in results if not r["matched"]][:5]
+        if history_missing_repos:
             print(
-                "Contributor stats unavailable for sample repos: "
-                + ", ".join(cast(List[str], pending_repos))
+                "Commit history unavailable for sample repos: "
+                + ", ".join(cast(List[str], history_missing_repos))
             )
         if unmatched_repos:
             print(
-                "No matching contributor login found for sample repos: "
+                "No matching commit history found for sample repos: "
                 + ", ".join(cast(List[str], unmatched_repos))
             )
 
         if fallback_cache is not None:
             print(
-                "GitHub contributor stats returned zero lines changed; "
+                "GitHub commit history returned zero lines changed; "
                 "reusing the previous non-zero cache."
             )
             self._lines_changed = fallback_cache
             return self._lines_changed
 
         print(
-            "GitHub contributor stats returned zero lines changed and "
+            "GitHub commit history returned zero lines changed and "
             "no non-zero cache is available."
         )
         self._lines_changed = (0, 0)
