@@ -273,6 +273,7 @@ class Stats(object):
         self._repos: Optional[Set[str]] = None
         self._lines_changed: Optional[Tuple[int, int]] = None
         self._views: Optional[int] = None
+        self._login: Optional[str] = None
 
     async def to_str(self) -> str:
         """
@@ -316,13 +317,14 @@ Languages:
             )
             raw_results = raw_results if raw_results is not None else {}
 
+            self._login = (
+                raw_results.get("data", {})
+                .get("viewer", {})
+                .get("login", self.username)
+            )
             self._name = raw_results.get("data", {}).get("viewer", {}).get("name", None)
             if self._name is None:
-                self._name = (
-                    raw_results.get("data", {})
-                    .get("viewer", {})
-                    .get("login", "No Name")
-                )
+                self._name = self._login
 
             contrib_repos = (
                 raw_results.get("data", {})
@@ -436,6 +438,17 @@ Languages:
         return {k: v.get("prop", 0) for (k, v) in self._languages.items()}
 
     @property
+    async def login(self) -> str:
+        """
+        :return: GitHub login (username) of the authenticated user
+        """
+        if self._login is not None:
+            return self._login
+        await self.get_stats()
+        assert self._login is not None
+        return self._login
+
+    @property
     async def repos(self) -> Set[str]:
         """
         :return: list of names of user's repos
@@ -492,7 +505,7 @@ Languages:
                 ):
                     continue
                 author = author_obj.get("author", {}).get("login", "")
-                if author != self.username:
+                if author != await self.login:
                     continue
 
                 for week in author_obj.get("weeks", []):
