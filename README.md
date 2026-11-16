@@ -96,6 +96,18 @@ For more information on inaccuracies, see issue
      [main
      workflow](https://github.com/jstrieb/github-stats/blob/master/.github/workflows/main.yml))
      called `EXCLUDE_FORKED_REPOS` with a value of `true`.
+   - By default the language badge uses GitHub's file size statistics, which
+     include code you never wrote (upstream history of detached forks,
+     vendored code, generated notebooks). Set `LANGUAGE_MODE` to `authored`
+     to count only lines added in commits authored by you. The first run
+     clones your repositories with `--filter=blob:none`; later runs reuse
+     per-repository results from `generated/authored_languages_cache.json`
+     until your commits change. The cache is restored with the GitHub Actions
+     cache and is not committed, since it contains private repository names.
+     Authored mode includes forks you own, because only your own commits are
+     counted. Use `EXCLUDED_LANGUAGE_REPOS` (comma-separated `owner/name`) to
+     skip data-heavy repositories in the language badge without removing them
+     from the overview statistics.
    - These other values are added as secrets by default to prevent leaking
      information about private repositories. If you're not worried about that,
      you can change the values directly [in the Actions workflow

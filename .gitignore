@@ -134,3 +134,6 @@ dmypy.json
 
 # PyCharm project files
 .idea
+
+# Per-repository authored language cache (restored via GitHub Actions cache)
+generated/authored_languages_cache.json

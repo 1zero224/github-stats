@@ -32,6 +32,16 @@ jobs:
         python -m pip install --upgrade pip setuptools wheel
         python -m pip install -r requirements.txt
 
+    # Persist per-repository authored language results between runs. The cache
+    # is not committed because it contains private repository names.
+    - name: Restore authored languages cache
+      uses: actions/cache@v4
+      with:
+        path: generated/authored_languages_cache.json
+        key: authored-languages-${{ github.run_id }}
+        restore-keys: |
+          authored-languages-
+
     # Generate all statistics images
     - name: Generate images
       run: |
@@ -42,8 +52,13 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         EXCLUDED: ${{ secrets.EXCLUDED }}
         EXCLUDED_LANGS: ${{ secrets.EXCLUDED_LANGS }}
+        # Skip data/annotation dumps in the language badge only.
+        EXCLUDED_LANGUAGE_REPOS: 1zero224/defect-synthesis
         EXCLUDE_FORKED_REPOS: true
         ADDITIONAL_USERNAMES: ${{ secrets.ADDITIONAL_USERNAMES }}
+        # Count only lines added in commits authored by the user instead of
+        # every file in every repository (GitHub's byte-based statistics).
+        LANGUAGE_MODE: authored
 
     # Commit all changed files to the repository
     - name: Commit to the repo

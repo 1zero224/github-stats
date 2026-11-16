@@ -3,9 +3,11 @@
 import asyncio
 import os
 import re
+from typing import Optional, Set
 
 import aiohttp
 
+from authored_languages import authored_languages
 from github_stats import Stats
 
 
@@ -49,18 +51,39 @@ async def generate_overview(s: Stats) -> None:
         f.write(output)
 
 
-async def generate_languages(s: Stats) -> None:
+async def generate_languages(
+    s: Stats,
+    excluded_langs: Optional[Set[str]] = None,
+    mode: str = "size",
+    excluded_repos: Optional[Set[str]] = None,
+) -> None:
     """
     Generate an SVG badge with summary languages used
     :param s: Represents user's GitHub statistics
+    :param excluded_langs: languages to omit from the badge
+    :param mode: "size" to use GitHub's file size statistics, or "authored"
+                 to count lines added in the user's own commits
+    :param excluded_repos: repositories to omit from the authored statistics
     """
     with open("templates/languages.svg", "r") as f:
         output = f.read()
 
     progress = ""
     lang_list = ""
+    if mode == "authored":
+        languages = await authored_languages(s, excluded_langs, excluded_repos)
+        if not languages:
+            raise RuntimeError(
+                "Authored language statistics are empty; refusing to write "
+                "an empty badge. Check the workflow logs for failed repos."
+            )
+        title = "Languages Used (By Authored Lines)"
+    else:
+        languages = await s.languages
+        title = "Languages Used (By File Size)"
+
     sorted_languages = sorted(
-        (await s.languages).items(), reverse=True, key=lambda t: t[1].get("size")
+        languages.items(), reverse=True, key=lambda t: t[1].get("size")
     )
     delay_between = 150
     for i, (lang, data) in enumerate(sorted_languages):
@@ -82,6 +105,7 @@ fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8z"></path></svg>
 
 """
 
+    output = re.sub(r"{{ title }}", title, output)
     output = re.sub(r"{{ progress }}", progress, output)
     output = re.sub(r"{{ lang_list }}", lang_list, output)
 
@@ -124,6 +148,18 @@ async def main() -> None:
     additional_usernames = (
         {x.strip() for x in raw_additional.split(",")} if raw_additional else None
     )
+    raw_excluded_language_repos = os.getenv("EXCLUDED_LANGUAGE_REPOS")
+    excluded_language_repos = (
+        {x.strip() for x in raw_excluded_language_repos.split(",") if x.strip()}
+        if raw_excluded_language_repos
+        else None
+    )
+    language_mode = os.getenv("LANGUAGE_MODE", "size").strip().lower()
+    if language_mode not in ("size", "authored"):
+        raise ValueError(
+            "LANGUAGE_MODE must be either 'size' or 'authored', "
+            f"got: {language_mode}"
+        )
     async with aiohttp.ClientSession() as session:
         s = Stats(
             user,
@@ -134,7 +170,12 @@ async def main() -> None:
             ignore_forked_repos=ignore_forked_repos,
             additional_usernames=additional_usernames,
         )
-        await asyncio.gather(generate_languages(s), generate_overview(s))
+        await asyncio.gather(
+            generate_languages(
+                s, excluded_langs, language_mode, excluded_language_repos
+            ),
+            generate_overview(s),
+        )
 
 
 if __name__ == "__main__":
